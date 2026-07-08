@@ -23,7 +23,7 @@ env:
   PYTHON_VERSION: "3.12"
 
 jobs:
-  dependency-policy:
+  dependency-sca-policy:
     name: "Dependencies - Policy"
     runs-on: ubuntu-latest
     continue-on-error: true
@@ -43,13 +43,31 @@ jobs:
 
           findings = []
           inventory = []
+          python_dependency_files_found = 0
+          npm_dependency_files_found = 0
           skip_dirs = {".git", ".github", "node_modules", ".venv", "venv", "env", ".env", "dist", "build", "__pycache__", "coverage", ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache"}
 
           def skip(path):
               return any(part in skip_dirs for part in str(path).replace("\\", "/").split("/"))
 
+          def dependency_severity(sev, rule, kind="vulnerability"):
+              rule = str(rule or "").upper()
+              sev = str(sev or "HIGH").upper()
+
+              if rule in {"PYPROJECT_TOML_PARSE_ERROR", "NPM_PACKAGE_JSON_PARSE_ERROR"}:
+                  return "CRITICAL"
+
+              # Politica organizacional:
+              # todo hallazgo de dependencias queda como HIGH como minimo.
+              # Justificacion: riesgo actual de supply chain, malware, typosquatting,
+              # dependency confusion, paquetes comprometidos, builds no reproducibles
+              # y dependencias transitivas no controladas.
+              order = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0, "UNKNOWN": 0}
+              return sev if order.get(sev, 0) >= order["HIGH"] else "HIGH"
+
           def add(sev, rule, file_path, line, msg, kind="vulnerability", ecosystem="unknown", package="", version=""):
-              findings.append({"tool": "Dependency Policy", "category": "Dependencias / Policy", "severity": sev, "rule": rule, "file": str(file_path), "line": int(line or 1), "message": msg, "kind": kind, "ecosystem": ecosystem, "package": package, "version": version})
+              final_sev = dependency_severity(sev, rule, kind)
+              findings.append({"tool": "Dependency Policy", "category": "Dependencias / SCA", "severity": final_sev, "rule": rule, "file": str(file_path), "line": int(line or 1), "message": msg, "kind": kind, "ecosystem": ecosystem, "package": package, "version": version})
 
           def inv(ecosystem, file_path, line, package, version, source):
               inventory.append({"ecosystem": ecosystem, "file": str(file_path), "line": int(line or 1), "package": str(package or ""), "version": str(version or ""), "source": source})
@@ -69,7 +87,7 @@ jobs:
                   return
               if re.match(r"^(https?|git|ssh)://|^file:", line, re.I):
                   inv("python", path, line_no, line, line, source)
-                  add("INFO", "PYTHON_DEPENDENCY_URL_OR_VCS", path, line_no, "Dependencia Python por URL/VCS/local no validada como pin simple: " + line, "hygiene", "python", line, line)
+                  add("INFO", "PYTHON_DEPENDENCY_URL_OR_VCS", path, line_no, "Dependencia Python declarada mediante URL, VCS o ruta local. Riesgo alto de supply chain, sustitucion de origen, malware y builds no reproducibles. Use un registro confiable, fije una version exacta y valide integridad: " + line, "hygiene", "python", line, line)
                   return
               clean = line.split(" #", 1)[0].strip()
               name_match = re.match(r"^\s*([A-Za-z0-9_.-]+)", clean)
@@ -79,21 +97,21 @@ jobs:
               if exact:
                   return
               if re.match(r"^\s*[A-Za-z0-9_.-]+(\[[A-Za-z0-9_,.-]+\])?\s*$", clean):
-                  add("MEDIUM", "PYTHON_DEPENDENCY_WITHOUT_VERSION", path, line_no, "Dependencia Python sin version declarada: " + line, "vulnerability", "python", pkg, "")
+                  add("MEDIUM", "PYTHON_DEPENDENCY_WITHOUT_VERSION", path, line_no, "La dependencia Python no especifica una version fija. Utilice un pin exacto (==) para garantizar reproducibilidad, facilitar el analisis SCA y reducir el riesgo de cambios inesperados: " + line, "vulnerability", "python", pkg, "")
                   return
               if re.search(r"\s*(>=|<=|~=|>|<|!=|===|\^)\s*", clean):
-                  add("MEDIUM", "PYTHON_DEPENDENCY_NOT_EXACT_PIN", path, line_no, "Dependencia Python sin pin exacto ==: " + line, "hygiene", "python", pkg, clean)
+                  add("MEDIUM", "PYTHON_DEPENDENCY_NOT_EXACT_PIN", path, line_no, "La dependencia Python utiliza un rango o un especificador no deterministico. Tras validar la compatibilidad, sustituya el rango por una version fija con ==: " + line, "hygiene", "python", pkg, clean)
                   return
-              add("MEDIUM", "PYTHON_DEPENDENCY_INVALID_FORMAT", path, line_no, "Linea de dependencia Python no validable: " + line, "hygiene", "python", pkg, clean)
+              add("MEDIUM", "PYTHON_DEPENDENCY_INVALID_FORMAT", path, line_no, "La declaracion de la dependencia Python no pudo interpretarse correctamente. Revise el formato y utilice una sintaxis compatible con PEP 440: " + line, "hygiene", "python", pkg, clean)
 
           def check_python_runtime(path, line_no, value, source):
               value = str(value or "").strip()
               inv("python-runtime", path, line_no, "python", value, source)
               if not value:
-                  add("MEDIUM", "PYTHON_REQUIRES_PYTHON_MISSING", path, line_no, "requires-python vacio o no declarado.", "hygiene", "python", "python", value)
+                  add("MEDIUM", "PYTHON_REQUIRES_PYTHON_MISSING", path, line_no, "requires-python no esta declarado o esta vacio. Riesgo alto: permite ejecutar el proyecto sobre runtimes no validados. Defina una version de Python controlada.", "hygiene", "python", "python", value)
                   return
               if re.search(r"(>=|<=|>|<|~=|\*|,)", value):
-                  add("MEDIUM", "PYTHON_RUNTIME_NOT_EXACT_PIN", path, line_no, "Version de Python no exacta/reproducible: requires-python = " + value, "hygiene", "python", "python", value)
+                  add("MEDIUM", "PYTHON_RUNTIME_NOT_EXACT_PIN", path, line_no, "Version de Python no exacta o no reproducible. Riesgo alto: diferencias de runtime pueden cambiar dependencias transitivas y superficie de ataque. Declare una version o politica de runtime controlada: requires-python = " + value, "hygiene", "python", "python", value)
 
           def check_npm(path, line_no, name, version, source):
               name = str(name)
@@ -101,36 +119,42 @@ jobs:
               inv("npm", path, line_no, name, version, source)
               exact = re.compile(r"^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$")
               if version.startswith(("file:", "git+", "github:", "workspace:", "link:")):
-                  add("INFO", "NPM_LOCAL_OR_WORKSPACE_DEPENDENCY", path, line_no, f"Dependencia npm local/workspace no validada: {name}@{version}", "hygiene", "npm", name, version)
+                  add("INFO", "NPM_LOCAL_OR_WORKSPACE_DEPENDENCY", path, line_no, f"Dependencia npm local, workspace o enlazada. Riesgo alto: puede evadir controles de registro, integridad y versionado. Valide origen, trazabilidad y versionado: {name}@{version}", "hygiene", "npm", name, version)
               elif version in {"", "*", "latest"}:
-                  add("MEDIUM", "NPM_DEPENDENCY_WITHOUT_VERSION", path, line_no, f"Dependencia npm sin version exacta: {name}@{version}", "vulnerability", "npm", name, version)
+                  add("MEDIUM", "NPM_DEPENDENCY_WITHOUT_VERSION", path, line_no, f"La dependencia npm no utiliza una version fija. Evite rangos (^, ~, >=, latest o *) y establezca una version exacta para garantizar compilaciones reproducibles: {name}@{version}", "vulnerability", "npm", name, version)
               elif not exact.match(version):
-                  add("MEDIUM", "NPM_DEPENDENCY_NOT_EXACT_PIN", path, line_no, f"Dependencia npm sin version exacta: {name}@{version}", "hygiene", "npm", name, version)
+                  add("MEDIUM", "NPM_DEPENDENCY_NOT_EXACT_PIN", path, line_no, f"La dependencia npm no utiliza una version fija. Evite rangos (^, ~, >=, latest o *) y establezca una version exacta para garantizar compilaciones reproducibles: {name}@{version}", "hygiene", "npm", name, version)
 
           for path in sorted(pathlib.Path(".").rglob("*")):
               if skip(path) or not path.is_file():
                   continue
               n = path.name.lower()
-              if n in {"requirements.txt", "requirements-dev.txt", "requirements-test.txt", "requirements-prod.txt", "requirements-production.txt", "https://urldefense.com/v3/__http://requirements.in__;!!P110LumUDw!-09i2YpAOxWE5RPIQX4W1NriVeL1x5_Wpp5aTY5acAffNR84YGTHxIt0OCwRWkPNRU2qU_O-PemfcbeLUflT2t5tBG9wRg$ ", "constraints.txt", "dev-requirements.txt", "test-requirements.txt", "prod-requirements.txt"} or (n.startswith("requirements") and n.endswith((".txt", ".in", ".pip"))):
-                  for idx, raw in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
+              if n in {"requirements.txt", "requirements-dev.txt", "requirements-test.txt", "requirements-prod.txt", "requirements-production.txt", "https://urldefense.com/v3/__http://requirements.in__;!!P110LumUDw!94XyBMn9RyiEyfa2uB1J-zEqMM2ZwxawjK7pI-dE4ocyK1SqNbwcWnEPun5ihMaB5BwFIVAtchftlu24Bl84MyZcJEqVtw$ ", "constraints.txt", "dev-requirements.txt", "test-requirements.txt", "prod-requirements.txt"} or (n.startswith("requirements") and n.endswith((".txt", ".in", ".pip"))):
+                  python_dependency_files_found += 1
+                  raw_lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+                  useful_lines = [line.strip() for line in raw_lines if line.strip() and not line.strip().startswith("#")]
+                  if not useful_lines:
+                      add("HIGH", "PYTHON_DEPENDENCY_FILE_EMPTY", path, 1, "Archivo de dependencias Python vacio o sin dependencias utiles. Riesgo alto: el analisis SCA puede quedar incompleto si el proyecto utiliza librerias externas no declaradas.", "hygiene", "python")
+                  for idx, raw in enumerate(raw_lines, 1):
                       check_python_req(path, idx, raw, "requirements")
 
           for path in sorted(pathlib.Path(".").rglob("pyproject.toml")):
               if skip(path):
                   continue
+              python_dependency_files_found += 1
               try:
                   data = tomllib.loads(path.read_text(encoding="utf-8", errors="ignore"))
               except Exception as error:
-                  add("MEDIUM", "PYPROJECT_TOML_PARSE_ERROR", path, 1, f"No se pudo leer pyproject.toml: {error}", "hygiene", "python")
+                  add("MEDIUM", "PYPROJECT_TOML_PARSE_ERROR", path, 1, f"No se pudo interpretar pyproject.toml. Riesgo critico: impide construir el inventario completo de dependencias y puede dejar vulnerabilidades sin analizar: {error}", "hygiene", "python")
                   continue
               project = data.get("project", {})
               if isinstance(project, dict):
                   check_python_runtime(path, line_of(path, "requires-python"), project.get("requires-python", ""), "pyproject.project.requires-python")
                   deps = project.get("dependencies")
                   if deps is None:
-                      add("MEDIUM", "PYPROJECT_NO_PROJECT_DEPENDENCIES", path, 1, "pyproject.toml no declara [project].dependencies. Si el proyecto usa librerias, no quedaran auditadas por SCA.", "hygiene", "python")
+                      add("MEDIUM", "PYPROJECT_NO_PROJECT_DEPENDENCIES", path, 1, "pyproject.toml no declara [project].dependencies. Riesgo alto: si el proyecto utiliza librerias externas, quedaran fuera del inventario y del analisis SCA. Declare todas las dependencias directas.", "hygiene", "python")
                   elif isinstance(deps, list) and len(deps) == 0:
-                      add("MEDIUM", "PYPROJECT_EMPTY_PROJECT_DEPENDENCIES", path, line_of(path, "dependencies"), "pyproject.toml declara dependencies vacio. Si el proyecto usa librerias, no quedaran auditadas por SCA.", "hygiene", "python")
+                      add("MEDIUM", "PYPROJECT_EMPTY_PROJECT_DEPENDENCIES", path, line_of(path, "dependencies"), "pyproject.toml declara dependencies vacio. Riesgo alto: si existen librerias externas, quedaran fuera del inventario y del analisis SCA. Declare todas las dependencias directas.", "hygiene", "python")
                   elif isinstance(deps, list):
                       for dep in deps:
                           check_python_req(path, line_of(path, dep), dep, "pyproject.project.dependencies")
@@ -152,9 +176,9 @@ jobs:
                               version = spec if isinstance(spec, str) else str(spec.get("version", "")) if isinstance(spec, dict) else str(spec)
                               inv("python", path, line, name, version, f"poetry.{section}")
                               if not version or version == "*":
-                                  add("MEDIUM", "PYTHON_DEPENDENCY_WITHOUT_VERSION", path, line, f"Dependencia Poetry sin version exacta: {name}", "vulnerability", "python", name, version)
+                                  add("MEDIUM", "PYTHON_DEPENDENCY_WITHOUT_VERSION", path, line, f"Dependencia Poetry sin version exacta. Riesgo alto de supply chain y builds no reproducibles. Fije una version especifica y valide su origen: {name}", "vulnerability", "python", name, version)
                               elif version.startswith(("^", "~")) or any(op in version for op in [">=", "<=", ">", "<", "!="]):
-                                  add("MEDIUM", "PYTHON_DEPENDENCY_NOT_EXACT_PIN", path, line, f"Dependencia Poetry sin pin exacto ==: {name} = {version}", "hygiene", "python", name, version)
+                                  add("MEDIUM", "PYTHON_DEPENDENCY_NOT_EXACT_PIN", path, line, f"Dependencia Poetry con rango o especificador no deterministico. Riesgo alto: puede resolver versiones no verificadas. Reemplace el rango por una version exacta validada: {name} = {version}", "hygiene", "python", name, version)
               pdm = tool.get("pdm", {}) if isinstance(tool, dict) else {}
               if isinstance(pdm, dict):
                   dev_deps = pdm.get("dev-dependencies", {})
@@ -176,34 +200,56 @@ jobs:
                           if isinstance(dep, str):
                               check_python_req(path, line_of(path, dep), dep, f"dependency-groups.{group}")
 
-          for dep_file in ["poetry.lock", "Pipfile", "Pipfile.lock", "pdm.lock", "uv.lock", "setup.cfg", "https://urldefense.com/v3/__http://setup.py__;!!P110LumUDw!-09i2YpAOxWE5RPIQX4W1NriVeL1x5_Wpp5aTY5acAffNR84YGTHxIt0OCwRWkPNRU2qU_O-PemfcbeLUflT2t7-lhc-pw$ ", "tox.ini", "environment.yml", "environment.yaml", "conda.yml", "conda.yaml"]:
+          for dep_file in ["poetry.lock", "Pipfile", "Pipfile.lock", "pdm.lock", "uv.lock", "setup.cfg", "https://urldefense.com/v3/__http://setup.py__;!!P110LumUDw!94XyBMn9RyiEyfa2uB1J-zEqMM2ZwxawjK7pI-dE4ocyK1SqNbwcWnEPun5ihMaB5BwFIVAtchftlu24Bl84MyZK2Kgs0Q$ ", "tox.ini", "environment.yml", "environment.yaml", "conda.yml", "conda.yaml"]:
               for path in sorted(pathlib.Path(".").rglob(dep_file)):
                   if not skip(path) and path.is_file():
-                      add("INFO", "PYTHON_DEPENDENCY_FILE_DETECTED", path, 1, f"Archivo de dependencias Python detectado: {path}", "hygiene", "python")
+                      add("INFO", "PYTHON_DEPENDENCY_FILE_DETECTED", path, 1, f"Archivo de dependencias Python detectado. Riesgo alto si queda fuera del inventario SCA. Incluyalo en el control de supply chain y trazabilidad: {path}", "hygiene", "python")
 
           for package_json in sorted(pathlib.Path(".").rglob("package.json")):
               if skip(package_json):
                   continue
+              npm_dependency_files_found += 1
               try:
                   pkg = json.loads(package_json.read_text(encoding="utf-8", errors="ignore"))
               except Exception as error:
-                  add("MEDIUM", "NPM_PACKAGE_JSON_PARSE_ERROR", package_json, 1, f"No se pudo leer package.json: {error}", "hygiene", "npm")
+                  add("MEDIUM", "NPM_PACKAGE_JSON_PARSE_ERROR", package_json, 1, f"No se pudo interpretar package.json. Riesgo critico: impide construir el inventario npm y puede dejar vulnerabilidades sin analizar: {error}", "hygiene", "npm")
                   continue
+              declared_dependency_sections = 0
+              non_empty_dependency_sections = 0
               for section in ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies", "bundledDependencies"]:
                   deps = pkg.get(section, {})
+                  if section in pkg:
+                      declared_dependency_sections += 1
                   if isinstance(deps, dict):
+                      if len(deps) > 0:
+                          non_empty_dependency_sections += 1
                       for name, version in deps.items():
                           check_npm(package_json, line_of(package_json, name), name, version, f"package.json.{section}")
                   elif isinstance(deps, list):
+                      if len(deps) > 0:
+                          non_empty_dependency_sections += 1
                       for name in deps:
                           check_npm(package_json, line_of(package_json, name), name, "", f"package.json.{section}")
+              if declared_dependency_sections == 0:
+                  add("HIGH", "NPM_PACKAGE_JSON_NO_DEPENDENCY_SECTIONS", package_json, 1, "package.json no declara secciones de dependencias. Riesgo alto: si el proyecto utiliza librerias externas, quedaran fuera del inventario y del analisis SCA.", "hygiene", "npm")
+              elif non_empty_dependency_sections == 0:
+                  add("HIGH", "NPM_PACKAGE_JSON_EMPTY_DEPENDENCIES", package_json, 1, "package.json declara secciones de dependencias vacias. Riesgo alto: si el proyecto utiliza librerias externas, el analisis SCA quedara incompleto.", "hygiene", "npm")
 
           for dep_file in ["package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "pnpm-workspace.yaml", "lerna.json", "rush.json", "turbo.json", ".npmrc", ".yarnrc", ".yarnrc.yml"]:
               for path in sorted(pathlib.Path(".").rglob(dep_file)):
                   if not skip(path) and path.is_file():
-                      add("INFO", "NPM_DEPENDENCY_FILE_DETECTED", path, 1, f"Archivo de dependencias/config npm detectado: {path}", "hygiene", "npm")
+                      add("INFO", "NPM_DEPENDENCY_FILE_DETECTED", path, 1, f"Archivo de dependencias o configuracion npm detectado. Riesgo alto si queda fuera del inventario SCA. Incluyalo en el control de supply chain y dependencias transitivas: {path}", "hygiene", "npm")
 
-          pathlib.Path("dependency_inventory.json").write_text(json.dumps({"inventory": inventory}, indent=2, ensure_ascii=False), encoding="utf-8")
+          python_source_found = any(not skip(p) for p in pathlib.Path(".").rglob("*.py"))
+          npm_source_found = any(not skip(p) for pattern in ["*.js", "*.ts", "*.jsx", "*.tsx"] for p in pathlib.Path(".").rglob(pattern))
+
+          if python_source_found and python_dependency_files_found == 0:
+              add("HIGH", "PYTHON_DEPENDENCY_FILE_MISSING", ".", 1, "No se detecto archivo de dependencias Python, pero existen archivos .py. Riesgo alto: el proyecto puede usar librerias externas no inventariadas, lo que impide un analisis SCA completo.", "hygiene", "python")
+
+          if npm_source_found and npm_dependency_files_found == 0:
+              add("HIGH", "NPM_DEPENDENCY_FILE_MISSING", ".", 1, "No se detecto archivo de dependencias npm, pero existen archivos JavaScript/TypeScript. Riesgo alto: el proyecto puede usar librerias externas no inventariadas, lo que impide un analisis SCA completo.", "hygiene", "npm")
+
+          pathlib.Path("dependency_inventory.json").write_text(json.dumps({"inventory": inventory, "python_dependency_files_found": python_dependency_files_found, "npm_dependency_files_found": npm_dependency_files_found}, indent=2, ensure_ascii=False), encoding="utf-8")
           pathlib.Path("dependency_policy_findings.json").write_text(json.dumps({"tool": "Dependency Policy", "findings": findings}, indent=2, ensure_ascii=False), encoding="utf-8")
 
           def level(sev):
@@ -219,7 +265,7 @@ jobs:
           for f in findings:
               rid = f["rule"]
               rules.setdefault(rid, {"id": rid, "name": rid, "shortDescription": {"text": rid}, "fullDescription": {"text": f["message"]}, "defaultConfiguration": {"level": level(f["severity"])}})
-              results.append({"ruleId": rid, "level": level(f["severity"]), "message": {"text": f["message"]}, "properties": {"kind": f.get("kind", "vulnerability"), "category": f.get("category", "Dependencias / Policy"), "ecosystem": f.get("ecosystem", ""), "package": f.get("package", ""), "version": f.get("version", "")}, "locations": [{"physicalLocation": {"artifactLocation": {"uri": f["file"]}, "region": {"startLine": f["line"]}}}]})
+              results.append({"ruleId": rid, "level": level(f["severity"]), "message": {"text": f["message"]}, "properties": {"kind": f.get("kind", "vulnerability"), "category": f.get("category", "Dependencias / SCA"), "ecosystem": f.get("ecosystem", ""), "package": f.get("package", ""), "version": f.get("version", "")}, "locations": [{"physicalLocation": {"artifactLocation": {"uri": f["file"]}, "region": {"startLine": f["line"]}}}]})
           sarif = {"version": "2.1.0", "runs": [{"tool": {"driver": {"name": "Dependency Policy", "rules": list(rules.values())}}, "results": results}]}
           pathlib.Path("dependency_policy.sarif").write_text(json.dumps(sarif, indent=2, ensure_ascii=False), encoding="utf-8")
           print("Dependency policy findings:", len(findings))
@@ -239,13 +285,13 @@ jobs:
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: dependency_policy.sarif
-          category: dependency-policy
+          category: dependency-sca-policy
 
       - name: Upload dependency artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dependency-policy-results
+          name: dependency-sca-policy-results
           path: |
             dependency_policy_findings.json
             dependency_inventory.json
@@ -323,13 +369,13 @@ jobs:
                       add(path, idx, "INFO", "WEB_REQUEST_INPUT_ENTRYPOINT", "Codigo aplicativo", f"Entrada controlada por usuario asignada a '{var}'.", stripped, "HIGH")
 
                   if re.search(r"@\w*app\.route|@\w*router\.", stripped):
-                      add(path, idx, "INFO", "WEB_ROUTE_AUTH_REVIEW", "Codigo aplicativo", "Ruta HTTP detectada. Validar autenticacion/autorizacion si expone datos o acciones.", stripped, "MEDIUM", "Si la ruta es publica por diseno documente el riesgo; de lo contrario implemente autenticacion, autorizacion y controles de acceso.")
+                      add(path, idx, "INFO", "WEB_ROUTE_AUTH_REVIEW", "Codigo aplicativo", "Ruta HTTP detectada. Verificar autenticacion/autorizacion si expone datos o acciones.", stripped, "MEDIUM", "Si la ruta es publica por diseno documente el riesgo; de lo contrario implemente autenticacion, autorizacion y controles de acceso.")
 
                   if "sensitive_keywords" in stripped and "[" in stripped:
-                      add(path, idx, "MEDIUM", "AI_KEYWORD_BLACKLIST_SECURITY_CONTROL", "AI / LLM / Agentic", "Prompt injection / bypass: blacklist de keywords sensibles usada como control de seguridad. Es evadible con encoding, separacion de caracteres, idioma o reformulacion.", stripped, "HIGH")
+                      add(path, idx, "MEDIUM", "AI_KEYWORD_BLACKLIST_SECURITY_CONTROL", "AI / LLM / Agentic", "Posible Prompt Injection / bypass: blacklist de keywords sensibles usada como control de seguridad. Es evadible con encoding, separacion de caracteres, idioma o reformulacion.", stripped, "HIGH")
 
                   if "any(" in stripped and " in " in stripped and "sensitive" in stripped.lower():
-                      add(path, idx, "MEDIUM", "AI_KEYWORD_BLACKLIST_SECURITY_CONTROL", "AI / LLM / Agentic", "Prompt injection / bypass: comprobacion por keywords sensibles. Es evadible y no reemplaza autorizacion real.", stripped, "HIGH")
+                      add(path, idx, "MEDIUM", "AI_KEYWORD_BLACKLIST_SECURITY_CONTROL", "AI / LLM / Agentic", "Posible Prompt Injection / bypass: comprobacion por keywords sensibles. Es evadible y no reemplaza autorizacion real.", stripped, "HIGH")
 
                   if "os.environ" in stripped and any(token in stripped.lower() for token in ["reveal", "secret", "owner", "token", "key", "password"]):
                       sev = "HIGH" if "!=" in stripped or "==" in stripped else "MEDIUM"
@@ -338,7 +384,7 @@ jobs:
                       add(path, idx, sev, rule, "AI / LLM / Agentic", msg, stripped, "HIGH")
 
                   if (("forget" in stripped.lower() and "rules" in stripped.lower()) or ("new" in stripped.lower() and "operator" in stripped.lower())):
-                      add(path, idx, "HIGH", "AI_PROMPT_TRIGGERED_SECURITY_FLAG_BYPASS", "AI / LLM / Agentic", "Prompt injection/backdoor: condicion textual permite activar comportamiento sensible o cambiar flags de seguridad.", stripped, "HIGH")
+                      add(path, idx, "HIGH", "AI_PROMPT_TRIGGERED_SECURITY_FLAG_BYPASS", "AI / LLM / Agentic", "Posible Prompt Injection/backdoor: condicion textual permite activar comportamiento sensible o cambiar flags de seguridad.", stripped, "HIGH")
 
                   if "RetrievalQA.from_chain_type" in stripped:
                       add(path, idx, "MEDIUM", "AI_RAG_RETRIEVALQA_CHAIN", "AI / LLM / Agentic", "Uso de RetrievalQA/RAG detectado. Verificar prompt injection, autorizacion sobre documentos, aislamiento por tenant y filtrado de fuentes.", stripped, "HIGH")
@@ -347,7 +393,7 @@ jobs:
 
                   if any(loader in stripped for loader in ["PyPDFLoader(", "UnstructuredFileLoader(", "Docx2txtLoader(", "CSVLoader(", "TextLoader(", "DirectoryLoader("]):
                       sev = "MEDIUM" if has_route or has_request else "INFO"
-                      add(path, idx, sev, "AI_DOCUMENT_LOADER_PROMPT_INJECTION_RISK", "AI / LLM / Agentic", "Loader de documento para AI/RAG detectado. Validar origen, tipo, tamano, sandboxing y prompt injection desde documentos.", stripped, "MEDIUM", "Si el documento es fijo y confiable, puede ser riesgo contextual.")
+                      add(path, idx, sev, "AI_DOCUMENT_LOADER_PROMPT_INJECTION_RISK", "AI / LLM / Agentic", "Loader de documento para AI/RAG detectado. Verificar origen, tipo, tamano, sandboxing y prompt injection desde documentos.", stripped, "MEDIUM", "Si el documento es fijo y confiable, puede ser riesgo contextual.")
 
                   if any(v in stripped for v in ["FAISS.from_documents", "Chroma.from_documents", "Pinecone.from_documents"]):
                       add(path, idx, "MEDIUM", "AI_VECTORSTORE_FROM_DOCUMENTS", "AI / LLM / Agentic", "Vectorstore desde documentos detectado. Verificar data poisoning, PII, secretos embebidos y autorizacion de recuperacion.", stripped, "HIGH")
@@ -360,10 +406,10 @@ jobs:
                       add(path, idx, sev, "AI_PROVIDER_USAGE_COST_AND_DATA_BOUNDARY", "AI / LLM / Agentic", "Uso de proveedor/modelo AI detectado. Verificar API key, limites de costo, rate limiting, logging seguro y datos sensibles enviados al proveedor.", stripped, "MEDIUM")
 
                   if re.search(r"\.(run|invoke|predict|generate|complete)\((query|user_query|prompt|msg|message|search_query|input|question)\b", stripped):
-                      add(path, idx, "HIGH", "AI_USER_INPUT_TO_LLM_OR_RAG", "AI / LLM / Agentic", "La entrada potencialmente controlada por el usuario alcanza un LLM/RAG. Implemente validacion de entrada, aislamiento del contexto, filtros de prompt injection y autorizacion sobre los datos recuperados.", stripped, "HIGH")
+                      add(path, idx, "HIGH", "AI_USER_INPUT_TO_LLM_OR_RAG", "AI / LLM / Agentic", "La entrada controlada por el usuario puede influir en el comportamiento del modelo. Aplique validacion de entrada, aislamiento del contexto, delimitacion estricta del prompt del sistema, filtros contra prompt injection y controles de autorizacion sobre los datos recuperados. Implemente validacion de entrada, aislamiento del contexto, filtros de prompt injection y autorizacion sobre los datos recuperados.", stripped, "HIGH")
 
                   if "qa.run(" in stripped or ".run(query" in stripped or ".run(user_query" in stripped:
-                      add(path, idx, "HIGH", "AI_USER_INPUT_TO_LLM_OR_RAG", "AI / LLM / Agentic", "Prompt injection: query/input llega a qa.run()/chain.run().", stripped, "HIGH")
+                      add(path, idx, "HIGH", "AI_USER_INPUT_TO_LLM_OR_RAG", "AI / LLM / Agentic", "Posible Prompt Injection: query/input llega a qa.run()/chain.run().", stripped, "HIGH")
 
                   if "shell=True" in stripped and any(fn in stripped for fn in ["subprocess", "Popen", "check_output", "run("]):
                       add(path, idx, "HIGH", "CODE_COMMAND_INJECTION_SHELL_TRUE", "Codigo aplicativo", "Comando con shell=True detectado. Verificar si algun argumento depende de input de usuario.", stripped, "HIGH")
@@ -614,12 +660,12 @@ jobs:
             - id: web-python-flask-public-host
               languages: [python]
               severity: WARNING
-              message: "Flask app is exposed on https://urldefense.com/v3/__http://0.0.0.0__;!!P110LumUDw!-09i2YpAOxWE5RPIQX4W1NriVeL1x5_Wpp5aTY5acAffNR84YGTHxIt0OCwRWkPNRU2qU_O-PemfcbeLUflT2t5mahFPRA$ . Confirm network controls, authentication and production WSGI deployment."
+              message: "Flask app is exposed on https://urldefense.com/v3/__http://0.0.0.0__;!!P110LumUDw!94XyBMn9RyiEyfa2uB1J-zEqMM2ZwxawjK7pI-dE4ocyK1SqNbwcWnEPun5ihMaB5BwFIVAtchftlu24Bl84MyaLQQr3Ow$ . Confirm network controls, authentication and production WSGI deployment."
               pattern-either:
-                - pattern: app.run("https://urldefense.com/v3/__http://0.0.0.0__;!!P110LumUDw!-09i2YpAOxWE5RPIQX4W1NriVeL1x5_Wpp5aTY5acAffNR84YGTHxIt0OCwRWkPNRU2qU_O-PemfcbeLUflT2t5mahFPRA$ ", ...)
-                - pattern: app.run(host="https://urldefense.com/v3/__http://0.0.0.0__;!!P110LumUDw!-09i2YpAOxWE5RPIQX4W1NriVeL1x5_Wpp5aTY5acAffNR84YGTHxIt0OCwRWkPNRU2qU_O-PemfcbeLUflT2t5mahFPRA$ ", ...)
-                - pattern: $APP.run("https://urldefense.com/v3/__http://0.0.0.0__;!!P110LumUDw!-09i2YpAOxWE5RPIQX4W1NriVeL1x5_Wpp5aTY5acAffNR84YGTHxIt0OCwRWkPNRU2qU_O-PemfcbeLUflT2t5mahFPRA$ ", ...)
-                - pattern: $APP.run(host="https://urldefense.com/v3/__http://0.0.0.0__;!!P110LumUDw!-09i2YpAOxWE5RPIQX4W1NriVeL1x5_Wpp5aTY5acAffNR84YGTHxIt0OCwRWkPNRU2qU_O-PemfcbeLUflT2t5mahFPRA$ ", ...)
+                - pattern: app.run("https://urldefense.com/v3/__http://0.0.0.0__;!!P110LumUDw!94XyBMn9RyiEyfa2uB1J-zEqMM2ZwxawjK7pI-dE4ocyK1SqNbwcWnEPun5ihMaB5BwFIVAtchftlu24Bl84MyaLQQr3Ow$ ", ...)
+                - pattern: app.run(host="https://urldefense.com/v3/__http://0.0.0.0__;!!P110LumUDw!94XyBMn9RyiEyfa2uB1J-zEqMM2ZwxawjK7pI-dE4ocyK1SqNbwcWnEPun5ihMaB5BwFIVAtchftlu24Bl84MyaLQQr3Ow$ ", ...)
+                - pattern: $APP.run("https://urldefense.com/v3/__http://0.0.0.0__;!!P110LumUDw!94XyBMn9RyiEyfa2uB1J-zEqMM2ZwxawjK7pI-dE4ocyK1SqNbwcWnEPun5ihMaB5BwFIVAtchftlu24Bl84MyaLQQr3Ow$ ", ...)
+                - pattern: $APP.run(host="https://urldefense.com/v3/__http://0.0.0.0__;!!P110LumUDw!94XyBMn9RyiEyfa2uB1J-zEqMM2ZwxawjK7pI-dE4ocyK1SqNbwcWnEPun5ihMaB5BwFIVAtchftlu24Bl84MyaLQQr3Ow$ ", ...)
             - id: web-python-route-long-sleep-dos
               languages: [python]
               severity: WARNING
@@ -852,8 +898,163 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
-          docker run --rm --user "$(id -u):$(id -g)" -e TRIVY_CACHE_DIR=/tmp/trivy-cache -v "$PWD:/repo" aquasec/trivy:latest fs --scanners vuln,secret,misconfig --format json --output /repo/trivy_results.json --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --skip-dirs /repo/.git --skip-dirs /repo/node_modules --skip-dirs /repo/.github --skip-files /repo/.github/workflows/security.yml /repo || true
-          docker run --rm --user "$(id -u):$(id -g)" -e TRIVY_CACHE_DIR=/tmp/trivy-cache -v "$PWD:/repo" aquasec/trivy:latest fs --scanners vuln,secret,misconfig --format sarif --output /repo/trivy_results.sarif --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --skip-dirs /repo/.git --skip-dirs /repo/node_modules --skip-dirs /repo/.github --skip-files /repo/.github/workflows/security.yml /repo || true
+          docker run --rm --user "$(id -u):$(id -g)" -e TRIVY_CACHE_DIR=/tmp/trivy-cache -v "$PWD:/repo" aquasec/trivy:latest fs --scanners vuln,secret,misconfig --format json --output /repo/trivy_results_raw.json --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --skip-dirs /repo/.git --skip-dirs /repo/node_modules --skip-dirs /repo/.github --skip-files /repo/.github/workflows/security.yml /repo || true
+          docker run --rm --user "$(id -u):$(id -g)" -e TRIVY_CACHE_DIR=/tmp/trivy-cache -v "$PWD:/repo" aquasec/trivy:latest fs --scanners vuln,secret,misconfig --format sarif --output /repo/trivy_results_raw.sarif --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --skip-dirs /repo/.git --skip-dirs /repo/node_modules --skip-dirs /repo/.github --skip-files /repo/.github/workflows/security.yml /repo || true
+
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import re
+
+          raw_json = pathlib.Path("trivy_results_raw.json")
+          out_json = pathlib.Path("trivy_results.json")
+          raw_sarif = pathlib.Path("trivy_results_raw.sarif")
+          out_sarif = pathlib.Path("trivy_results.sarif")
+
+          def read_json(path, fallback):
+              try:
+                  return json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+              except Exception:
+                  return fallback
+
+          data = read_json(raw_json, {"Results": []})
+
+          repo = pathlib.Path(".").resolve()
+
+          def clean_target(target):
+              target = str(target or "").replace("\\", "/")
+              target = target.replace("/repo/", "").lstrip("/")
+              if target in {".", ""}:
+                  return ""
+              return target
+
+          def find_line_in_file(file_path, patterns):
+              try:
+                  lines = pathlib.Path(file_path).read_text(encoding="utf-8", errors="ignore").splitlines()
+              except Exception:
+                  return 1
+
+              pats = [p for p in patterns if p]
+              for idx, line in enumerate(lines, 1):
+                  for pat in pats:
+                      if pat and pat in line:
+                          return idx
+
+              lowered = [(p or "").lower() for p in pats]
+              for idx, line in enumerate(lines, 1):
+                  low = line.lower()
+                  for pat in lowered:
+                      if pat and pat in low:
+                          return idx
+
+              return 1
+
+          def resolve_line(target, item, kind):
+              target_clean = clean_target(target)
+
+              # Trivy misconfig often includes CauseMetadata with StartLine/EndLine.
+              cause = item.get("CauseMetadata") or {}
+              for key in ["StartLine", "Line", "EndLine"]:
+                  value = cause.get(key)
+                  if isinstance(value, int) and value > 0:
+                      return value
+
+              # Trivy secret often includes StartLine/EndLine.
+              for key in ["StartLine", "Line", "EndLine"]:
+                  value = item.get(key)
+                  if isinstance(value, int) and value > 0:
+                      return value
+
+              candidates = []
+              if target_clean:
+                  candidates.append(target_clean)
+
+              # Vulnerabilities in lockfiles usually only provide package name.
+              if kind == "vulnerability":
+                  candidates += [
+                      item.get("PkgName", ""),
+                      item.get("Name", ""),
+                      item.get("VulnerabilityID", ""),
+                  ]
+
+              if kind == "secret":
+                  candidates += [
+                      item.get("RuleID", ""),
+                      item.get("Title", ""),
+                      item.get("Match", ""),
+                  ]
+
+              if kind == "misconfig":
+                  candidates += [
+                      item.get("ID", ""),
+                      item.get("AVDID", ""),
+                      item.get("Title", ""),
+                  ]
+
+              file_path = repo / target_clean if target_clean else None
+              if file_path and file_path.exists() and file_path.is_file():
+                  return find_line_in_file(file_path, candidates)
+
+              return 1
+
+          for result in data.get("Results", []) if isinstance(data, dict) else []:
+              target = result.get("Target", "")
+              for vuln in result.get("Vulnerabilities", []) or []:
+                  line = resolve_line(target, vuln, "vulnerability")
+                  vuln["StartLine"] = line
+                  vuln["Line"] = line
+                  vuln["Location"] = f"{clean_target(target)}:{line}"
+              for secret in result.get("Secrets", []) or []:
+                  line = resolve_line(target, secret, "secret")
+                  secret["StartLine"] = line
+                  secret["Line"] = line
+                  secret["Location"] = f"{clean_target(target)}:{line}"
+              for misconf in result.get("Misconfigurations", []) or []:
+                  line = resolve_line(target, misconf, "misconfig")
+                  misconf["StartLine"] = line
+                  misconf["Line"] = line
+                  misconf["Location"] = f"{clean_target(target)}:{line}"
+
+          out_json.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+          sarif = read_json(raw_sarif, {"version": "2.1.0", "runs": [{"tool": {"driver": {"name": "Trivy", "rules": []}}, "results": []}]})
+          # Si Trivy SARIF no trae linea, se corrige usando el JSON enriquecido.
+          line_by_rule_target = {}
+          for result in data.get("Results", []) if isinstance(data, dict) else []:
+              target = clean_target(result.get("Target", ""))
+              for vuln in result.get("Vulnerabilities", []) or []:
+                  rid = vuln.get("VulnerabilityID", "")
+                  if rid:
+                      line_by_rule_target[(rid, target)] = vuln.get("StartLine", 1)
+              for secret in result.get("Secrets", []) or []:
+                  rid = secret.get("RuleID", "")
+                  if rid:
+                      line_by_rule_target[(rid, target)] = secret.get("StartLine", 1)
+              for misconf in result.get("Misconfigurations", []) or []:
+                  rid = misconf.get("ID", "") or misconf.get("AVDID", "")
+                  if rid:
+                      line_by_rule_target[(rid, target)] = misconf.get("StartLine", 1)
+
+          for run in sarif.get("runs", []) if isinstance(sarif, dict) else []:
+              for res in run.get("results", []) or []:
+                  rid = res.get("ruleId", "")
+                  for loc in res.get("locations", []) or []:
+                      phys = loc.setdefault("physicalLocation", {})
+                      art = phys.setdefault("artifactLocation", {})
+                      uri = clean_target(art.get("uri", ""))
+                      line = line_by_rule_target.get((rid, uri), None)
+                      if not line:
+                          # fallback: same rule in any file
+                          for (r, _t), l in line_by_rule_target.items():
+                              if r == rid:
+                                  line = l
+                                  break
+                      region = phys.setdefault("region", {})
+                      if not region.get("startLine") or region.get("startLine") == 0:
+                          region["startLine"] = int(line or 1)
+
+          out_sarif.write_text(json.dumps(sarif, indent=2, ensure_ascii=False), encoding="utf-8")
+          PY
       - name: Ensure SCA artifacts exist
         if: always()
         shell: bash
@@ -861,6 +1062,8 @@ jobs:
           test -f pip_audit_results.json || echo '{"dependencies":[]}' > pip_audit_results.json
           test -f pip_audit_osv.json || echo '{"dependencies":[]}' > pip_audit_osv.json
           test -f pip_audit.sarif || echo '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"pip-audit","rules":[]}},"results":[]}]}' > pip_audit.sarif
+          test -f trivy_results_raw.json || echo '{"Results":[]}' > trivy_results_raw.json
+          test -f trivy_results_raw.sarif || echo '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Trivy","rules":[]}},"results":[]}]}' > trivy_results_raw.sarif
           test -f trivy_results.json || echo '{"Results":[]}' > trivy_results.json
           test -f trivy_results.sarif || echo '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Trivy","rules":[]}},"results":[]}]}' > trivy_results.sarif
       - name: Upload pip-audit SARIF
@@ -886,6 +1089,8 @@ jobs:
             pip_audit_results.json
             pip_audit_osv.json
             pip_audit.sarif
+            trivy_results_raw.json
+            trivy_results_raw.sarif
             trivy_results.json
             trivy_results.sarif
           retention-days: 30
@@ -944,25 +1149,111 @@ jobs:
         run: |
           echo "[]" > hadolint_results.json
           echo '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Hadolint","rules":[]}},"results":[]}]}' > hadolint.sarif
-          dockerfiles="$(find . -type f \( -name 'Dockerfile' -o -name 'Dockerfile.*' \) -not -path './.git/*' -not -path './node_modules/*')"
+          dockerfiles="$(find . -type f \( -name 'Dockerfile' -o -name 'Dockerfile.*' \) -not -path './.git/*' -not -path './node_modules/*' -not -path './.github/*')"
           if [ -n "$dockerfiles" ]; then
             idx=0
+            : > hadolint_file_map.tsv
             for file in $dockerfiles; do
               idx=$((idx+1))
+              printf "%s\t%s\n" "$idx" "$file" >> hadolint_file_map.tsv
               docker run --rm -i hadolint/hadolint:latest hadolint --format json - < "$file" > "hadolint_${idx}.json" || true
             done
             python3 - <<'PY'
-          import json, pathlib
-          data = []
-          for path in pathlib.Path(".").glob("hadolint_*.json"):
+          import json
+          import pathlib
+
+          file_map = {}
+          map_path = pathlib.Path("hadolint_file_map.tsv")
+          if map_path.exists():
+              for raw in map_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                  parts = raw.split("\t", 1)
+                  if len(parts) == 2:
+                      file_map[parts[0]] = parts[1]
+
+          findings = []
+          for path in sorted(pathlib.Path(".").glob("hadolint_*.json")):
+              idx = path.stem.replace("hadolint_", "", 1)
+              dockerfile = file_map.get(idx, "Dockerfile")
               try:
-                  item = json.loads(path.read_text(encoding="utf-8", errors="ignore") or "[]")
+                  data = json.loads(path.read_text(encoding="utf-8", errors="ignore") or "[]")
               except Exception:
-                  item = []
-              if isinstance(item, dict):
-                  item = [item]
-              data.extend([x for x in item if isinstance(x, dict)])
-          pathlib.Path("hadolint_results.json").write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+                  data = []
+
+              if isinstance(data, dict):
+                  data = [data]
+
+              for item in data:
+                  if not isinstance(item, dict):
+                      continue
+
+                  line = item.get("line") or item.get("lineNumber") or item.get("startLine") or 1
+                  column = item.get("column") or item.get("columnNumber") or 1
+
+                  item["file"] = dockerfile
+                  item["filename"] = dockerfile
+                  item["path"] = dockerfile
+                  item["line"] = int(line or 1)
+                  item["lineNumber"] = int(line or 1)
+                  item["column"] = int(column or 1)
+                  item["location"] = f"{dockerfile}:{int(line or 1)}"
+                  findings.append(item)
+
+          pathlib.Path("hadolint_results.json").write_text(json.dumps(findings, indent=2, ensure_ascii=False), encoding="utf-8")
+
+          rules = {}
+          results = []
+
+          def level(value):
+              value = str(value or "").lower()
+              if value in {"error"}:
+                  return "error"
+              if value in {"warning"}:
+                  return "warning"
+              return "note"
+
+          for item in findings:
+              code = item.get("code") or item.get("rule") or "HADOLINT"
+              message = item.get("message") or item.get("description") or "Hallazgo Hadolint"
+              dockerfile = item.get("file") or item.get("filename") or "Dockerfile"
+              line = int(item.get("line") or item.get("lineNumber") or 1)
+              col = int(item.get("column") or 1)
+
+              rules.setdefault(code, {
+                  "id": code,
+                  "name": code,
+                  "shortDescription": {"text": code},
+                  "fullDescription": {"text": message},
+                  "defaultConfiguration": {"level": level(item.get("level"))}
+              })
+
+              results.append({
+                  "ruleId": code,
+                  "level": level(item.get("level")),
+                  "message": {"text": message},
+                  "properties": {
+                      "kind": "vulnerability",
+                      "category": "Docker / Contenedores",
+                      "dockerfile": dockerfile
+                  },
+                  "locations": [{
+                      "physicalLocation": {
+                          "artifactLocation": {"uri": dockerfile},
+                          "region": {
+                              "startLine": line,
+                              "startColumn": col
+                          }
+                      }
+                  }]
+              })
+
+          sarif = {
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {"driver": {"name": "Hadolint", "rules": list(rules.values())}},
+                  "results": results
+              }]
+          }
+          pathlib.Path("hadolint.sarif").write_text(json.dumps(sarif, indent=2, ensure_ascii=False), encoding="utf-8")
           PY
           fi
           echo "[]" > dockle_results.json
@@ -1024,7 +1315,7 @@ jobs:
     name: "Report - Centralized Security Summary"
     runs-on: ubuntu-latest
     needs:
-      - dependency-policy
+      - dependency-sca-policy
       - code-ai-static
       - ruff
       - codeql
@@ -1059,6 +1350,13 @@ jobs:
               sev = str(sev or "UNKNOWN").upper()
               return {"ERROR": "HIGH", "WARNING": "MEDIUM", "WARN": "MEDIUM", "NOTE": "LOW", "STYLE": "LOW"}.get(sev, sev)
 
+          def force_dependency_severity(cat, sev):
+              sev = norm(sev)
+              if str(cat or "") == "Dependencias / SCA":
+                  order = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0, "UNKNOWN": 0}
+                  return sev if order.get(sev, 0) >= 3 else "HIGH"
+              return sev
+
           def is_excluded_workflow(value):
               value = str(value or "").replace("\\", "/")
               return ".github/workflows/security.yml" in value or ".github/workflows/" in value
@@ -1066,7 +1364,7 @@ jobs:
           def add(cat, sev, tool, loc, detail, rule="", source="", fp_note=""):
               if is_excluded_workflow(loc) or is_excluded_workflow(detail) or is_excluded_workflow(source):
                   return
-              item={"category":cat,"severity":norm(sev),"tool":tool,"location":loc or "?:?","detail":str(detail or "").replace("\n"," ")[:3000],"rule":rule or "","source":source or "","fp_note":fp_note or ""}
+              item={"category":cat,"severity":force_dependency_severity(cat, sev),"tool":tool,"location":loc or "?:?","detail":str(detail or "").replace("\n"," ")[:3000],"rule":rule or "","source":source or "","fp_note":fp_note or ""}
               dup = None
               for i, x in enumerate(findings):
                   if x["location"] == item["location"] and x["rule"] == item["rule"]:
@@ -1123,7 +1421,7 @@ jobs:
               count = 0
               for item in data.get("findings", []):
                   count += 1
-                  add(item.get("category", "Dependencias / Policy"), item.get("severity", "UNKNOWN"), "Dependency Policy", f"{item.get('file','?')}:{item.get('line','?')}", item.get("message", ""), item.get("rule", ""), str(path))
+                  add(item.get("category", "Dependencias / SCA"), item.get("severity", "UNKNOWN"), "Dependency Policy", f"{item.get('file','?')}:{item.get('line','?')}", item.get("message", ""), item.get("rule", ""), str(path))
               tool_status.append({"artifact": str(path), "tool": "Dependency Policy", "findings": count})
 
           for path, data in load_all("dependency_inventory.json"):
@@ -1136,23 +1434,31 @@ jobs:
               for dep in deps:
                   for vuln in dep.get("vulns", []) or []:
                       count += 1
-                      add("Dependencias / SCA", vuln.get("severity", "HIGH"), "pip-audit", f"{dep.get('name','?')}:?", f"{dep.get('name','?')} {dep.get('version','')}: {vuln.get('id','')} - {vuln.get('description','')}", vuln.get("id", ""), str(path))
+                      add("Dependencias / SCA", vuln.get("severity", "HIGH"), "pip-audit", f"{dep.get('name','?')}:?", f"{dep.get('name','?')} {dep.get('version','')}: {vuln.get('id','')} - {vuln.get('description','')}. Recomendacion: actualice a una version corregida, regenere lockfiles y valide origen confiable.", vuln.get("id", ""), str(path))
               tool_status.append({"artifact": str(path), "tool": "pip-audit", "findings": count})
 
           for path, data in load_all("trivy_results.json"):
               count = 0
               for result in data.get("Results", []) if isinstance(data, dict) else []:
                   target = result.get("Target", "?")
+                  clean_target = str(target).replace("/repo/", "").lstrip("/")
                   for vuln in result.get("Vulnerabilities", []) or []:
                       count += 1
-                      add("Dependencias / SCA", vuln.get("Severity", "UNKNOWN"), "Trivy", f"{target}:?", f"{vuln.get('PkgName','')} {vuln.get('InstalledVersion','')} - {vuln.get('VulnerabilityID','')} - {vuln.get('Title','')}", vuln.get("VulnerabilityID", ""), str(path))
+                      line = vuln.get("StartLine") or vuln.get("Line") or 1
+                      loc = vuln.get("Location") or f"{clean_target}:{line}"
+                      detalle = f"{vuln.get('PkgName','')} {vuln.get('InstalledVersion','')} - {vuln.get('VulnerabilityID','')} - {vuln.get('Title','')}. Recomendacion: actualice a una version corregida, regenere lockfiles y valide origen confiable."
+                      add("Dependencias / SCA", vuln.get("Severity", "UNKNOWN"), "Trivy", loc, detalle, vuln.get("VulnerabilityID", ""), str(path))
                   for secret in result.get("Secrets", []) or []:
                       count += 1
-                      add("Secretos", secret.get("Severity", "HIGH"), "Trivy", f"{target}:?", secret.get("Title", "Possible secret"), secret.get("RuleID", ""), str(path))
+                      line = secret.get("StartLine") or secret.get("Line") or 1
+                      loc = secret.get("Location") or f"{clean_target}:{line}"
+                      add("Secretos", secret.get("Severity", "HIGH"), "Trivy", loc, secret.get("Title", "Possible secret"), secret.get("RuleID", ""), str(path))
                   for misconf in result.get("Misconfigurations", []) or []:
                       count += 1
+                      line = misconf.get("StartLine") or misconf.get("Line") or 1
+                      loc = misconf.get("Location") or f"{clean_target}:{line}"
                       cat = "Docker / Contenedores" if "dockerfile" in str(target).lower() else "IaC / Cloud / Config"
-                      add(cat, misconf.get("Severity", "UNKNOWN"), "Trivy", f"{target}:?", f"{misconf.get('ID','')} - {misconf.get('Title','')}", misconf.get("ID", ""), str(path))
+                      add(cat, misconf.get("Severity", "UNKNOWN"), "Trivy", loc, f"{misconf.get('ID','')} - {misconf.get('Title','')}", misconf.get("ID", ""), str(path))
               tool_status.append({"artifact": str(path), "tool": "Trivy", "findings": count})
 
           for path, data in load_all("gitleaks_report.json"):
@@ -1175,7 +1481,7 @@ jobs:
                       fp = check.get("file_path", "?")
                       cat = "Docker / Contenedores" if "dockerfile" in str(fp).lower() else "IaC / Cloud / Config"
                       lr = check.get("file_line_range") or ["?"]
-                      add(cat, "HIGH", "Checkov", f"{fp}:{lr[0]}", check.get("check_name", ""), check.get("check_id", ""), str(path), "Muchos checks Checkov son hardening; validar contexto antes de tratarlos como vulnerabilidad explotable.")
+                      add(cat, "HIGH", "Checkov", f"{fp}:{lr[0]}", check.get("check_name", ""), check.get("check_id", ""), str(path), "; validar contexto antes de tratarlos como vulnerabilidad explotable.")
               tool_status.append({"artifact": str(path), "tool": "Checkov", "findings": count})
 
           for path, data in load_all("hadolint_results.json"):
@@ -1183,7 +1489,11 @@ jobs:
               if isinstance(data, list):
                   for item in data:
                       count += 1
-                      add("Docker / Contenedores", item.get("level", "warning"), "Hadolint", f"{item.get('file', item.get('filename','Dockerfile'))}:{item.get('line', item.get('lineNumber','?'))}", item.get("message", item.get("description", "")), item.get("code", ""), str(path), "Hadolint suele ser hardening/calidad Docker; priorizar segun exposicion.")
+                      dockerfile = item.get("file") or item.get("filename") or item.get("path") or "Dockerfile"
+                      line = item.get("line") or item.get("lineNumber") or item.get("startLine") or 1
+                      loc = item.get("location") or f"{dockerfile}:{line}"
+                      detalle = item.get("message") or item.get("description") or "Hallazgo Hadolint"
+                      add("Docker / Contenedores", item.get("level", "warning"), "Hadolint", loc, detalle, item.get("code", ""), str(path), "Recomendacion: Corrija este hallazgo siguiendo las buenas practicas de construccion de imagenes Docker. El archivo afectado y la linea se muestran en la ubicacion del hallazgo.")
               tool_status.append({"artifact": str(path), "tool": "Hadolint", "findings": count})
 
           for path, data in load_all("ruff_dev_quality_findings.json"):
@@ -1193,7 +1503,7 @@ jobs:
                   quality.append(item)
               tool_status.append({"artifact": str(path), "tool": "Ruff", "findings": count, "type": "quality"})
 
-          cats = sorted(set([item["category"] for item in findings]) | {"AI / LLM / Agentic", "Codigo aplicativo", "Dependencias / SCA", "Dependencias / Policy", "Secretos", "Docker / Contenedores", "IaC / Cloud / Config", "Pipeline / Parser"})
+          cats = sorted(set([item["category"] for item in findings]) | {"AI / LLM / Agentic", "Codigo aplicativo", "Dependencias / SCA", "Dependencias / SCA", "Secretos", "Docker / Contenedores", "IaC / Cloud / Config", "Pipeline / Parser"})
           sevs = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "UNKNOWN"]
           table = {cat: {sev: 0 for sev in sevs} for cat in cats}
           for item in findings:
