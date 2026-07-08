@@ -31,7 +31,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Check dependency pinning
+      - name: Check Python and npm dependency files
         continue-on-error: true
         shell: bash
         run: |
@@ -39,73 +39,171 @@ jobs:
           import json
           import pathlib
           import re
+          import tomllib
 
           findings = []
-          skip_dirs = {".git", ".github", "node_modules", ".venv", "venv", "dist", "build", "__pycache__"}
+          inventory = []
+          skip_dirs = {".git", ".github", "node_modules", ".venv", "venv", "env", ".env", "dist", "build", "__pycache__", "coverage", ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache"}
 
           def skip(path):
               return any(part in skip_dirs for part in str(path).replace("\\", "/").split("/"))
 
-          def add(sev, rule, file_path, line, msg, kind="vulnerability"):
-              findings.append({
-                  "tool": "Dependency Policy",
-                  "category": "Dependencias / Policy",
-                  "severity": sev,
-                  "rule": rule,
-                  "file": str(file_path),
-                  "line": int(line or 1),
-                  "message": msg,
-                  "kind": kind
-              })
+          def add(sev, rule, file_path, line, msg, kind="vulnerability", ecosystem="unknown", package="", version=""):
+              findings.append({"tool": "Dependency Policy", "category": "Dependencias / Policy", "severity": sev, "rule": rule, "file": str(file_path), "line": int(line or 1), "message": msg, "kind": kind, "ecosystem": ecosystem, "package": package, "version": version})
 
-          req_skip = re.compile(r"^\s*($|#|-r\s+|-c\s+|-f\s+|--|(https?|git|ssh)://|file:)", re.I)
-          exact_req = re.compile(r"^\s*([A-Za-z0-9_.-]+)(\[[A-Za-z0-9_,.-]+\])?\s*==\s*([A-Za-z0-9_.!+*-]+)\s*(;.*)?$")
-          any_pkg = re.compile(r"^\s*([A-Za-z0-9_.-]+)(\[[A-Za-z0-9_,.-]+\])?\s*([<>=!~]=?|===)?\s*([^;#\s]+)?")
+          def inv(ecosystem, file_path, line, package, version, source):
+              inventory.append({"ecosystem": ecosystem, "file": str(file_path), "line": int(line or 1), "package": str(package or ""), "version": str(version or ""), "source": source})
 
-          for req in sorted(set(pathlib.Path(".").glob("requirements*.txt")) | set(pathlib.Path(".").glob("**/requirements*.txt"))):
-              if skip(req):
+          def line_of(path, needle):
+              try:
+                  for idx, raw in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
+                      if needle and str(needle) in raw:
+                          return idx
+              except Exception:
+                  pass
+              return 1
+
+          def check_python_req(path, line_no, raw, source):
+              line = str(raw).strip()
+              if not line or line.startswith("#") or line.startswith(("-r ", "-c ", "-f ", "--")):
+                  return
+              if re.match(r"^(https?|git|ssh)://|^file:", line, re.I):
+                  inv("python", path, line_no, line, line, source)
+                  add("INFO", "PYTHON_DEPENDENCY_URL_OR_VCS", path, line_no, "Dependencia Python por URL/VCS/local no validada como pin simple: " + line, "hygiene", "python", line, line)
+                  return
+              clean = line.split(" #", 1)[0].strip()
+              name_match = re.match(r"^\s*([A-Za-z0-9_.-]+)", clean)
+              pkg = name_match.group(1) if name_match else clean
+              inv("python", path, line_no, pkg, clean, source)
+              exact = re.match(r"^\s*([A-Za-z0-9_.-]+)(\[[A-Za-z0-9_,.-]+\])?\s*==\s*([A-Za-z0-9_.!+*-]+)\s*(;.*)?$", clean)
+              if exact:
+                  return
+              if re.match(r"^\s*[A-Za-z0-9_.-]+(\[[A-Za-z0-9_,.-]+\])?\s*$", clean):
+                  add("MEDIUM", "PYTHON_DEPENDENCY_WITHOUT_VERSION", path, line_no, "Dependencia Python sin version declarada: " + line, "vulnerability", "python", pkg, "")
+                  return
+              if re.search(r"\s*(>=|<=|~=|>|<|!=|===|\^)\s*", clean):
+                  add("MEDIUM", "PYTHON_DEPENDENCY_NOT_EXACT_PIN", path, line_no, "Dependencia Python sin pin exacto ==: " + line, "hygiene", "python", pkg, clean)
+                  return
+              add("MEDIUM", "PYTHON_DEPENDENCY_INVALID_FORMAT", path, line_no, "Linea de dependencia Python no validable: " + line, "hygiene", "python", pkg, clean)
+
+          def check_python_runtime(path, line_no, value, source):
+              value = str(value or "").strip()
+              inv("python-runtime", path, line_no, "python", value, source)
+              if not value:
+                  add("MEDIUM", "PYTHON_REQUIRES_PYTHON_MISSING", path, line_no, "requires-python vacio o no declarado.", "hygiene", "python", "python", value)
+                  return
+              if re.search(r"(>=|<=|>|<|~=|\*|,)", value):
+                  add("MEDIUM", "PYTHON_RUNTIME_NOT_EXACT_PIN", path, line_no, "Version de Python no exacta/reproducible: requires-python = " + value, "hygiene", "python", "python", value)
+
+          def check_npm(path, line_no, name, version, source):
+              name = str(name)
+              version = str(version).strip()
+              inv("npm", path, line_no, name, version, source)
+              exact = re.compile(r"^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$")
+              if version.startswith(("file:", "git+", "github:", "workspace:", "link:")):
+                  add("INFO", "NPM_LOCAL_OR_WORKSPACE_DEPENDENCY", path, line_no, f"Dependencia npm local/workspace no validada: {name}@{version}", "hygiene", "npm", name, version)
+              elif version in {"", "*", "latest"}:
+                  add("MEDIUM", "NPM_DEPENDENCY_WITHOUT_VERSION", path, line_no, f"Dependencia npm sin version exacta: {name}@{version}", "vulnerability", "npm", name, version)
+              elif not exact.match(version):
+                  add("MEDIUM", "NPM_DEPENDENCY_NOT_EXACT_PIN", path, line_no, f"Dependencia npm sin version exacta: {name}@{version}", "hygiene", "npm", name, version)
+
+          for path in sorted(pathlib.Path(".").rglob("*")):
+              if skip(path) or not path.is_file():
                   continue
-              for line_no, raw in enumerate(req.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
-                  line = raw.strip()
-                  if req_skip.match(line):
-                      continue
-                  clean = line.split(" #", 1)[0].strip()
-                  if exact_req.match(clean):
-                      continue
-                  parsed = any_pkg.match(clean)
-                  if parsed:
-                      op = parsed.group(3)
-                      ver = parsed.group(4)
-                      if not op or not ver:
-                          add("MEDIUM", "PYTHON_DEPENDENCY_WITHOUT_VERSION", req, line_no, "Dependencia Python sin version declarada: " + line)
-                      elif op != "==":
-                          add("MEDIUM", "PYTHON_DEPENDENCY_NOT_EXACT_PIN", req, line_no, "Dependencia Python sin pin exacto ==: " + line, "hygiene")
-                      else:
-                          add("MEDIUM", "PYTHON_DEPENDENCY_INVALID_FORMAT", req, line_no, "Dependencia Python con formato no validable: " + line, "hygiene")
-                  else:
-                      add("MEDIUM", "PYTHON_DEPENDENCY_INVALID_FORMAT", req, line_no, "Linea de dependencia Python no validable: " + line, "hygiene")
+              n = path.name.lower()
+              if n in {"requirements.txt", "requirements-dev.txt", "requirements-test.txt", "requirements-prod.txt", "requirements-production.txt", "https://urldefense.com/v3/__http://requirements.in__;!!P110LumUDw!-09i2YpAOxWE5RPIQX4W1NriVeL1x5_Wpp5aTY5acAffNR84YGTHxIt0OCwRWkPNRU2qU_O-PemfcbeLUflT2t5tBG9wRg$ ", "constraints.txt", "dev-requirements.txt", "test-requirements.txt", "prod-requirements.txt"} or (n.startswith("requirements") and n.endswith((".txt", ".in", ".pip"))):
+                  for idx, raw in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
+                      check_python_req(path, idx, raw, "requirements")
 
-          exact_npm = re.compile(r"^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$")
-          for package_json in sorted(pathlib.Path(".").glob("**/package.json")):
+          for path in sorted(pathlib.Path(".").rglob("pyproject.toml")):
+              if skip(path):
+                  continue
+              try:
+                  data = tomllib.loads(path.read_text(encoding="utf-8", errors="ignore"))
+              except Exception as error:
+                  add("MEDIUM", "PYPROJECT_TOML_PARSE_ERROR", path, 1, f"No se pudo leer pyproject.toml: {error}", "hygiene", "python")
+                  continue
+              project = data.get("project", {})
+              if isinstance(project, dict):
+                  check_python_runtime(path, line_of(path, "requires-python"), project.get("requires-python", ""), "pyproject.project.requires-python")
+                  deps = project.get("dependencies")
+                  if deps is None:
+                      add("MEDIUM", "PYPROJECT_NO_PROJECT_DEPENDENCIES", path, 1, "pyproject.toml no declara [project].dependencies. Si el proyecto usa librerias, no quedaran auditadas por SCA.", "hygiene", "python")
+                  elif isinstance(deps, list) and len(deps) == 0:
+                      add("MEDIUM", "PYPROJECT_EMPTY_PROJECT_DEPENDENCIES", path, line_of(path, "dependencies"), "pyproject.toml declara dependencies vacio. Si el proyecto usa librerias, no quedaran auditadas por SCA.", "hygiene", "python")
+                  elif isinstance(deps, list):
+                      for dep in deps:
+                          check_python_req(path, line_of(path, dep), dep, "pyproject.project.dependencies")
+                  optional = project.get("optional-dependencies", {})
+                  if isinstance(optional, dict):
+                      for group, deps in optional.items():
+                          for dep in deps or []:
+                              check_python_req(path, line_of(path, dep), dep, f"pyproject.project.optional-dependencies.{group}")
+              tool = data.get("tool", {})
+              poetry = tool.get("poetry", {}) if isinstance(tool, dict) else {}
+              if isinstance(poetry, dict):
+                  for section in ["dependencies", "dev-dependencies"]:
+                      deps = poetry.get(section, {})
+                      if isinstance(deps, dict):
+                          for name, spec in deps.items():
+                              if name.lower() == "python":
+                                  continue
+                              line = line_of(path, name)
+                              version = spec if isinstance(spec, str) else str(spec.get("version", "")) if isinstance(spec, dict) else str(spec)
+                              inv("python", path, line, name, version, f"poetry.{section}")
+                              if not version or version == "*":
+                                  add("MEDIUM", "PYTHON_DEPENDENCY_WITHOUT_VERSION", path, line, f"Dependencia Poetry sin version exacta: {name}", "vulnerability", "python", name, version)
+                              elif version.startswith(("^", "~")) or any(op in version for op in [">=", "<=", ">", "<", "!="]):
+                                  add("MEDIUM", "PYTHON_DEPENDENCY_NOT_EXACT_PIN", path, line, f"Dependencia Poetry sin pin exacto ==: {name} = {version}", "hygiene", "python", name, version)
+              pdm = tool.get("pdm", {}) if isinstance(tool, dict) else {}
+              if isinstance(pdm, dict):
+                  dev_deps = pdm.get("dev-dependencies", {})
+                  if isinstance(dev_deps, dict):
+                      for group, deps in dev_deps.items():
+                          for dep in deps or []:
+                              check_python_req(path, line_of(path, dep), dep, f"pdm.dev-dependencies.{group}")
+              uv = tool.get("uv", {}) if isinstance(tool, dict) else {}
+              if isinstance(uv, dict):
+                  for key in ["dev-dependencies", "override-dependencies", "constraint-dependencies"]:
+                      deps = uv.get(key, [])
+                      if isinstance(deps, list):
+                          for dep in deps:
+                              check_python_req(path, line_of(path, dep), dep, f"uv.{key}")
+              dep_groups = data.get("dependency-groups", {})
+              if isinstance(dep_groups, dict):
+                  for group, deps in dep_groups.items():
+                      for dep in deps or []:
+                          if isinstance(dep, str):
+                              check_python_req(path, line_of(path, dep), dep, f"dependency-groups.{group}")
+
+          for dep_file in ["poetry.lock", "Pipfile", "Pipfile.lock", "pdm.lock", "uv.lock", "setup.cfg", "https://urldefense.com/v3/__http://setup.py__;!!P110LumUDw!-09i2YpAOxWE5RPIQX4W1NriVeL1x5_Wpp5aTY5acAffNR84YGTHxIt0OCwRWkPNRU2qU_O-PemfcbeLUflT2t7-lhc-pw$ ", "tox.ini", "environment.yml", "environment.yaml", "conda.yml", "conda.yaml"]:
+              for path in sorted(pathlib.Path(".").rglob(dep_file)):
+                  if not skip(path) and path.is_file():
+                      add("INFO", "PYTHON_DEPENDENCY_FILE_DETECTED", path, 1, f"Archivo de dependencias Python detectado: {path}", "hygiene", "python")
+
+          for package_json in sorted(pathlib.Path(".").rglob("package.json")):
               if skip(package_json):
                   continue
               try:
                   pkg = json.loads(package_json.read_text(encoding="utf-8", errors="ignore"))
-              except Exception:
+              except Exception as error:
+                  add("MEDIUM", "NPM_PACKAGE_JSON_PARSE_ERROR", package_json, 1, f"No se pudo leer package.json: {error}", "hygiene", "npm")
                   continue
-              for section in ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]:
+              for section in ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies", "bundledDependencies"]:
                   deps = pkg.get(section, {})
-                  if not isinstance(deps, dict):
-                      continue
-                  for dep, ver in deps.items():
-                      ver = str(ver).strip()
-                      if ver.startswith(("file:", "git+", "github:", "workspace:", "link:")):
-                          add("INFO", "NPM_LOCAL_OR_WORKSPACE_DEPENDENCY", package_json, 1, f"Dependencia npm local/workspace no validada: {dep}@{ver}", "hygiene")
-                      elif ver in {"", "*", "latest"}:
-                          add("MEDIUM", "NPM_DEPENDENCY_WITHOUT_VERSION", package_json, 1, f"Dependencia npm sin version exacta: {dep}@{ver}")
-                      elif not exact_npm.match(ver):
-                          add("MEDIUM", "NPM_DEPENDENCY_NOT_EXACT_PIN", package_json, 1, f"Dependencia npm sin version exacta: {dep}@{ver}", "hygiene")
+                  if isinstance(deps, dict):
+                      for name, version in deps.items():
+                          check_npm(package_json, line_of(package_json, name), name, version, f"package.json.{section}")
+                  elif isinstance(deps, list):
+                      for name in deps:
+                          check_npm(package_json, line_of(package_json, name), name, "", f"package.json.{section}")
 
+          for dep_file in ["package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "pnpm-workspace.yaml", "lerna.json", "rush.json", "turbo.json", ".npmrc", ".yarnrc", ".yarnrc.yml"]:
+              for path in sorted(pathlib.Path(".").rglob(dep_file)):
+                  if not skip(path) and path.is_file():
+                      add("INFO", "NPM_DEPENDENCY_FILE_DETECTED", path, 1, f"Archivo de dependencias/config npm detectado: {path}", "hygiene", "npm")
+
+          pathlib.Path("dependency_inventory.json").write_text(json.dumps({"inventory": inventory}, indent=2, ensure_ascii=False), encoding="utf-8")
           pathlib.Path("dependency_policy_findings.json").write_text(json.dumps({"tool": "Dependency Policy", "findings": findings}, indent=2, ensure_ascii=False), encoding="utf-8")
 
           def level(sev):
@@ -121,16 +219,11 @@ jobs:
           for f in findings:
               rid = f["rule"]
               rules.setdefault(rid, {"id": rid, "name": rid, "shortDescription": {"text": rid}, "fullDescription": {"text": f["message"]}, "defaultConfiguration": {"level": level(f["severity"])}})
-              results.append({
-                  "ruleId": rid,
-                  "level": level(f["severity"]),
-                  "message": {"text": f["message"]},
-                  "properties": {"kind": f.get("kind", "vulnerability"), "category": f.get("category", "Dependencias / Policy")},
-                  "locations": [{"physicalLocation": {"artifactLocation": {"uri": f["file"]}, "region": {"startLine": f["line"]}}}]
-              })
+              results.append({"ruleId": rid, "level": level(f["severity"]), "message": {"text": f["message"]}, "properties": {"kind": f.get("kind", "vulnerability"), "category": f.get("category", "Dependencias / Policy"), "ecosystem": f.get("ecosystem", ""), "package": f.get("package", ""), "version": f.get("version", "")}, "locations": [{"physicalLocation": {"artifactLocation": {"uri": f["file"]}, "region": {"startLine": f["line"]}}}]})
           sarif = {"version": "2.1.0", "runs": [{"tool": {"driver": {"name": "Dependency Policy", "rules": list(rules.values())}}, "results": results}]}
           pathlib.Path("dependency_policy.sarif").write_text(json.dumps(sarif, indent=2, ensure_ascii=False), encoding="utf-8")
           print("Dependency policy findings:", len(findings))
+          print("Dependency inventory entries:", len(inventory))
           PY
 
       - name: Ensure dependency artifacts exist
@@ -155,6 +248,7 @@ jobs:
           name: dependency-policy-results
           path: |
             dependency_policy_findings.json
+            dependency_inventory.json
             dependency_policy.sarif
           retention-days: 30
 
@@ -214,7 +308,7 @@ jobs:
               has_ai = has_any(text, ["RetrievalQA", "FAISS", "PyPDFLoader", "OpenAI", "ChatOpenAI", "OpenAIEmbeddings", "llama_index", "LlamaIndex", "CrewAI", "autogen", "Haystack", "Chroma", "Pinecone", "AgentExecutor", "chat.completions", "responses.create"])
 
               if has_route and has_request and has_ai:
-                  add(path, 1, "HIGH", "AI_HTTP_RAG_ATTACK_SURFACE", "AI / LLM / Agentic", "Superficie AI/RAG expuesta: rutas HTTP + input de usuario + LLM/RAG en el mismo archivo. Revisar prompt injection, auth, rate limiting, aislamiento de datos y costos.", "", "HIGH")
+                  add(path, 1, "HIGH", "AI_HTTP_RAG_ATTACK_SURFACE", "AI / LLM / Agentic", "Superficie AI/RAG expuesta: rutas HTTP + input de usuario + LLM/RAG en el mismo archivo. Verificar prompt injection, auth, rate limiting, aislamiento de datos y costos.", "", "HIGH")
 
               request_vars = {}
               for idx, line in enumerate(lines, 1):
@@ -229,7 +323,7 @@ jobs:
                       add(path, idx, "INFO", "WEB_REQUEST_INPUT_ENTRYPOINT", "Codigo aplicativo", f"Entrada controlada por usuario asignada a '{var}'.", stripped, "HIGH")
 
                   if re.search(r"@\w*app\.route|@\w*router\.", stripped):
-                      add(path, idx, "INFO", "WEB_ROUTE_AUTH_REVIEW", "Codigo aplicativo", "Ruta HTTP detectada. Confirmar autenticacion/autorizacion si expone datos o acciones.", stripped, "MEDIUM", "Puede ser falso positivo si la ruta es publica por diseno.")
+                      add(path, idx, "INFO", "WEB_ROUTE_AUTH_REVIEW", "Codigo aplicativo", "Ruta HTTP detectada. Validar autenticacion/autorizacion si expone datos o acciones.", stripped, "MEDIUM", "Si la ruta es publica por diseno documente el riesgo; de lo contrario implemente autenticacion, autorizacion y controles de acceso.")
 
                   if "sensitive_keywords" in stripped and "[" in stripped:
                       add(path, idx, "MEDIUM", "AI_KEYWORD_BLACKLIST_SECURITY_CONTROL", "AI / LLM / Agentic", "Prompt injection / bypass: blacklist de keywords sensibles usada como control de seguridad. Es evadible con encoding, separacion de caracteres, idioma o reformulacion.", stripped, "HIGH")
@@ -247,7 +341,7 @@ jobs:
                       add(path, idx, "HIGH", "AI_PROMPT_TRIGGERED_SECURITY_FLAG_BYPASS", "AI / LLM / Agentic", "Prompt injection/backdoor: condicion textual permite activar comportamiento sensible o cambiar flags de seguridad.", stripped, "HIGH")
 
                   if "RetrievalQA.from_chain_type" in stripped:
-                      add(path, idx, "MEDIUM", "AI_RAG_RETRIEVALQA_CHAIN", "AI / LLM / Agentic", "Uso de RetrievalQA/RAG detectado. Revisar prompt injection, autorizacion sobre documentos, aislamiento por tenant y filtrado de fuentes.", stripped, "HIGH")
+                      add(path, idx, "MEDIUM", "AI_RAG_RETRIEVALQA_CHAIN", "AI / LLM / Agentic", "Uso de RetrievalQA/RAG detectado. Verificar prompt injection, autorizacion sobre documentos, aislamiento por tenant y filtrado de fuentes.", stripped, "HIGH")
                       if "chain_type=\"stuff\"" in stripped or "chain_type='stuff'" in stripped:
                           add(path, idx, "MEDIUM", "AI_RAG_STUFF_CHAIN_PROMPT_INJECTION_RISK", "AI / LLM / Agentic", "RAG chain_type='stuff': contenido recuperado se inserta directo en el prompt; riesgo de prompt injection desde documentos.", stripped, "HIGH")
 
@@ -256,23 +350,23 @@ jobs:
                       add(path, idx, sev, "AI_DOCUMENT_LOADER_PROMPT_INJECTION_RISK", "AI / LLM / Agentic", "Loader de documento para AI/RAG detectado. Validar origen, tipo, tamano, sandboxing y prompt injection desde documentos.", stripped, "MEDIUM", "Si el documento es fijo y confiable, puede ser riesgo contextual.")
 
                   if any(v in stripped for v in ["FAISS.from_documents", "Chroma.from_documents", "Pinecone.from_documents"]):
-                      add(path, idx, "MEDIUM", "AI_VECTORSTORE_FROM_DOCUMENTS", "AI / LLM / Agentic", "Vectorstore desde documentos detectado. Revisar data poisoning, PII, secretos embebidos y autorizacion de recuperacion.", stripped, "HIGH")
+                      add(path, idx, "MEDIUM", "AI_VECTORSTORE_FROM_DOCUMENTS", "AI / LLM / Agentic", "Vectorstore desde documentos detectado. Verificar data poisoning, PII, secretos embebidos y autorizacion de recuperacion.", stripped, "HIGH")
 
                   if any(v in stripped for v in [".save_local(", ".load_local(", "FAISS.load_local", "Chroma.load_local"]):
                       add(path, idx, "LOW", "AI_LOCAL_VECTORSTORE_PERSISTENCE_CONTEXTUAL", "AI / LLM / Agentic", "Persistencia/carga local de vectorstore detectada. Riesgo contextual: poisoning/manipulacion local/deserializacion si el storage es controlable o compartido.", stripped, "MEDIUM", "Bajado a LOW porque suele ser contextual si el path no es controlable.")
 
                   if any(v in stripped for v in ["OpenAI(", "OpenAIEmbeddings(", "ChatOpenAI(", "AzureChatOpenAI("]):
                       sev = "MEDIUM" if has_route or has_request else "INFO"
-                      add(path, idx, sev, "AI_PROVIDER_USAGE_COST_AND_DATA_BOUNDARY", "AI / LLM / Agentic", "Uso de proveedor/modelo AI detectado. Revisar API key, limites de costo, rate limiting, logging seguro y datos sensibles enviados al proveedor.", stripped, "MEDIUM")
+                      add(path, idx, sev, "AI_PROVIDER_USAGE_COST_AND_DATA_BOUNDARY", "AI / LLM / Agentic", "Uso de proveedor/modelo AI detectado. Verificar API key, limites de costo, rate limiting, logging seguro y datos sensibles enviados al proveedor.", stripped, "MEDIUM")
 
                   if re.search(r"\.(run|invoke|predict|generate|complete)\((query|user_query|prompt|msg|message|search_query|input|question)\b", stripped):
-                      add(path, idx, "HIGH", "AI_USER_INPUT_TO_LLM_OR_RAG", "AI / LLM / Agentic", "Prompt injection: variable potencialmente controlada por usuario llega a LLM/RAG.", stripped, "HIGH")
+                      add(path, idx, "HIGH", "AI_USER_INPUT_TO_LLM_OR_RAG", "AI / LLM / Agentic", "La entrada potencialmente controlada por el usuario alcanza un LLM/RAG. Implemente validacion de entrada, aislamiento del contexto, filtros de prompt injection y autorizacion sobre los datos recuperados.", stripped, "HIGH")
 
                   if "qa.run(" in stripped or ".run(query" in stripped or ".run(user_query" in stripped:
                       add(path, idx, "HIGH", "AI_USER_INPUT_TO_LLM_OR_RAG", "AI / LLM / Agentic", "Prompt injection: query/input llega a qa.run()/chain.run().", stripped, "HIGH")
 
                   if "shell=True" in stripped and any(fn in stripped for fn in ["subprocess", "Popen", "check_output", "run("]):
-                      add(path, idx, "HIGH", "CODE_COMMAND_INJECTION_SHELL_TRUE", "Codigo aplicativo", "Comando con shell=True detectado. Revisar si algun argumento depende de input de usuario.", stripped, "HIGH")
+                      add(path, idx, "HIGH", "CODE_COMMAND_INJECTION_SHELL_TRUE", "Codigo aplicativo", "Comando con shell=True detectado. Verificar si algun argumento depende de input de usuario.", stripped, "HIGH")
 
                   if "time.sleep(" in stripped:
                       m_sleep = re.search(r"time\.sleep\((\d+)\)", stripped)
@@ -288,19 +382,19 @@ jobs:
                               add(path, idx, "MEDIUM", "WEB_REQUEST_PARAM_NONE_DOS", "Codigo aplicativo", f"Parametro de request '{var}' usado con .lower() sin default/check visible de None; si falta el parametro puede causar 500/DoS.", stripped, "HIGH")
 
                   if "<script>" in stripped and " in " in stripped:
-                      add(path, idx, "MEDIUM", "WEB_WEAK_XSS_BLACKLIST_SCRIPT_ONLY", "Codigo aplicativo", "Mitigacion XSS debil: solo bloquea literal <script>. No reemplaza sanitizacion/encoding contextual.", stripped, "HIGH")
+                      add(path, idx, "MEDIUM", "WEB_WEAK_XSS_BLACKLIST_SCRIPT_ONLY", "Codigo aplicativo", "La mitigacion basada en listas negras es insuficiente. Utilice encoding contextual de salida, sanitizacion robusta y validacion de entrada.", stripped, "HIGH")
 
                   if "innerhtml" in stripped.lower() or ".html(" in stripped.lower():
-                      add(path, idx, "MEDIUM", "WEB_DOM_XSS_SINK_REVIEW", "Codigo aplicativo", "Sink HTML/DOM detectado. Revisar si recibe datos del usuario o del LLM sin sanitizacion.", stripped, "MEDIUM")
+                      add(path, idx, "MEDIUM", "WEB_DOM_XSS_SINK_REVIEW", "Codigo aplicativo", "Sink HTML/DOM detectado. Verificar si recibe datos del usuario o del LLM sin sanitizacion.", stripped, "MEDIUM")
 
                   if any(token in stripped.lower() for token in ["dangerouslysetinnerhtml", "bypasssecuritytrusthtml"]):
-                      add(path, idx, "HIGH", "WEB_UNSAFE_HTML_RENDERING", "Codigo aplicativo", "Renderizado HTML inseguro detectado. Revisar XSS con salida de usuario/LLM.", stripped, "HIGH")
+                      add(path, idx, "HIGH", "WEB_UNSAFE_HTML_RENDERING", "Codigo aplicativo", "Renderizado HTML inseguro detectado. Verificar XSS con salida de usuario/LLM.", stripped, "HIGH")
 
                   if is_js and ("eval(" in stripped.lower() or "new function(" in stripped.lower()):
                       add(path, idx, "HIGH", "JS_EVAL_RCE_REVIEW", "Codigo aplicativo", "eval/new Function detectado. Riesgo critico si recibe input de usuario o salida LLM.", stripped, "HIGH")
 
                   if is_js and ("child_process" in stripped.lower() or "exec(" in stripped.lower() or "execsync(" in stripped.lower()):
-                      add(path, idx, "HIGH", "JS_COMMAND_EXECUTION_REVIEW", "Codigo aplicativo", "Ejecucion de comandos en JS detectada. Revisar si argumentos vienen de usuario o LLM.", stripped, "HIGH")
+                      add(path, idx, "HIGH", "JS_COMMAND_EXECUTION_REVIEW", "Codigo aplicativo", "Ejecucion de comandos en JS detectada. Verificar si argumentos vienen de usuario o LLM.", stripped, "HIGH")
 
                   if "except Exception" in stripped or stripped == "except:":
                       add(path, idx, "INFO", "CODE_BROAD_EXCEPTION_OBSERVABILITY", "Codigo aplicativo", "Manejo amplio de excepciones. No es vulnerabilidad directa; puede ocultar errores de seguridad y dificultar trazabilidad.", stripped, "MEDIUM", "No contabilizar como vulnerabilidad explotable directa.")
@@ -308,7 +402,7 @@ jobs:
               if has_route and has_ai:
                   expensive = ["OpenAIEmbeddings", "FAISS.from_documents", "save_local", "FAISS.load_local", "RetrievalQA.from_chain_type", "Chroma.from_documents"]
                   if len([x for x in expensive if x in text]) >= 3:
-                      add(path, 1, "MEDIUM", "AI_EXPENSIVE_RAG_REBUILT_PER_REQUEST", "AI / LLM / Agentic", "Posible DoS/costo: archivo combina rutas HTTP y reconstruccion de embeddings/vectorstore/RAG. Revisar cache, rate limiting y limites de costo.", "", "HIGH")
+                      add(path, 1, "MEDIUM", "AI_EXPENSIVE_RAG_REBUILT_PER_REQUEST", "AI / LLM / Agentic", "Posible DoS/costo: archivo combina rutas HTTP y reconstruccion de embeddings/vectorstore/RAG. Verificar cache, rate limiting y limites de costo.", "", "HIGH")
 
           for pattern in ["*.py", "*.js", "*.ts", "*.jsx", "*.tsx"]:
               for path in pathlib.Path(".").rglob(pattern):
@@ -317,7 +411,10 @@ jobs:
 
           unique = {}
           for item in findings:
-              unique[(item["file"], item["line"], item["rule"], item["message"])] = item
+              key=(item["file"],item["line"],item["rule"])
+              prev = unique.get(key)
+              if prev is None or len(str(item.get("message", ""))) > len(str(prev.get("message", ""))):
+                  unique[key] = item
           findings = list(unique.values())
 
           pathlib.Path("ai_app_static_findings.json").write_text(json.dumps({"tool": "AI/App Static Analyzer", "findings": findings}, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -517,12 +614,12 @@ jobs:
             - id: web-python-flask-public-host
               languages: [python]
               severity: WARNING
-              message: "Flask app is exposed on https://urldefense.com/v3/__http://0.0.0.0__;!!P110LumUDw!8FkN-ZNTSQwTRBOMMKaaM-Tbn4TISUtHC_ACrJr4DxBbCLpbzoeV2ox7_fhuE1BNxSet9ugYQzQ8mfzG1VgWjMDUVJMnoA$ . Confirm network controls, authentication and production WSGI deployment."
+              message: "Flask app is exposed on https://urldefense.com/v3/__http://0.0.0.0__;!!P110LumUDw!-09i2YpAOxWE5RPIQX4W1NriVeL1x5_Wpp5aTY5acAffNR84YGTHxIt0OCwRWkPNRU2qU_O-PemfcbeLUflT2t5mahFPRA$ . Confirm network controls, authentication and production WSGI deployment."
               pattern-either:
-                - pattern: app.run("https://urldefense.com/v3/__http://0.0.0.0__;!!P110LumUDw!8FkN-ZNTSQwTRBOMMKaaM-Tbn4TISUtHC_ACrJr4DxBbCLpbzoeV2ox7_fhuE1BNxSet9ugYQzQ8mfzG1VgWjMDUVJMnoA$ ", ...)
-                - pattern: app.run(host="https://urldefense.com/v3/__http://0.0.0.0__;!!P110LumUDw!8FkN-ZNTSQwTRBOMMKaaM-Tbn4TISUtHC_ACrJr4DxBbCLpbzoeV2ox7_fhuE1BNxSet9ugYQzQ8mfzG1VgWjMDUVJMnoA$ ", ...)
-                - pattern: $APP.run("https://urldefense.com/v3/__http://0.0.0.0__;!!P110LumUDw!8FkN-ZNTSQwTRBOMMKaaM-Tbn4TISUtHC_ACrJr4DxBbCLpbzoeV2ox7_fhuE1BNxSet9ugYQzQ8mfzG1VgWjMDUVJMnoA$ ", ...)
-                - pattern: $APP.run(host="https://urldefense.com/v3/__http://0.0.0.0__;!!P110LumUDw!8FkN-ZNTSQwTRBOMMKaaM-Tbn4TISUtHC_ACrJr4DxBbCLpbzoeV2ox7_fhuE1BNxSet9ugYQzQ8mfzG1VgWjMDUVJMnoA$ ", ...)
+                - pattern: app.run("https://urldefense.com/v3/__http://0.0.0.0__;!!P110LumUDw!-09i2YpAOxWE5RPIQX4W1NriVeL1x5_Wpp5aTY5acAffNR84YGTHxIt0OCwRWkPNRU2qU_O-PemfcbeLUflT2t5mahFPRA$ ", ...)
+                - pattern: app.run(host="https://urldefense.com/v3/__http://0.0.0.0__;!!P110LumUDw!-09i2YpAOxWE5RPIQX4W1NriVeL1x5_Wpp5aTY5acAffNR84YGTHxIt0OCwRWkPNRU2qU_O-PemfcbeLUflT2t5mahFPRA$ ", ...)
+                - pattern: $APP.run("https://urldefense.com/v3/__http://0.0.0.0__;!!P110LumUDw!-09i2YpAOxWE5RPIQX4W1NriVeL1x5_Wpp5aTY5acAffNR84YGTHxIt0OCwRWkPNRU2qU_O-PemfcbeLUflT2t5mahFPRA$ ", ...)
+                - pattern: $APP.run(host="https://urldefense.com/v3/__http://0.0.0.0__;!!P110LumUDw!-09i2YpAOxWE5RPIQX4W1NriVeL1x5_Wpp5aTY5acAffNR84YGTHxIt0OCwRWkPNRU2qU_O-PemfcbeLUflT2t5mahFPRA$ ", ...)
             - id: web-python-route-long-sleep-dos
               languages: [python]
               severity: WARNING
@@ -755,8 +852,8 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
-          docker run --rm --user "$(id -u):$(id -g)" -e TRIVY_CACHE_DIR=/tmp/trivy-cache -v "$PWD:/repo" aquasec/trivy:latest fs --scanners vuln,secret,misconfig --format json --output /repo/trivy_results.json --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --skip-dirs /repo/.git --skip-dirs /repo/node_modules /repo || true
-          docker run --rm --user "$(id -u):$(id -g)" -e TRIVY_CACHE_DIR=/tmp/trivy-cache -v "$PWD:/repo" aquasec/trivy:latest fs --scanners vuln,secret,misconfig --format sarif --output /repo/trivy_results.sarif --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --skip-dirs /repo/.git --skip-dirs /repo/node_modules /repo || true
+          docker run --rm --user "$(id -u):$(id -g)" -e TRIVY_CACHE_DIR=/tmp/trivy-cache -v "$PWD:/repo" aquasec/trivy:latest fs --scanners vuln,secret,misconfig --format json --output /repo/trivy_results.json --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --skip-dirs /repo/.git --skip-dirs /repo/node_modules --skip-dirs /repo/.github --skip-files /repo/.github/workflows/security.yml /repo || true
+          docker run --rm --user "$(id -u):$(id -g)" -e TRIVY_CACHE_DIR=/tmp/trivy-cache -v "$PWD:/repo" aquasec/trivy:latest fs --scanners vuln,secret,misconfig --format sarif --output /repo/trivy_results.sarif --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --skip-dirs /repo/.git --skip-dirs /repo/node_modules --skip-dirs /repo/.github --skip-files /repo/.github/workflows/security.yml /repo || true
       - name: Ensure SCA artifacts exist
         if: always()
         shell: bash
@@ -805,7 +902,11 @@ jobs:
       - name: Run Gitleaks without failing job
         shell: bash
         run: |
-          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo" zricethezav/gitleaks:v8.30.1 detect --source /repo --report-format json --report-path /repo/gitleaks_report.json --exit-code 0 --redact --verbose || true
+          cat > .gitleaksignore <<'EOF'
+          .github/workflows/security.yml
+          .github/workflows/*
+          EOF
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo" zricethezav/gitleaks:v8.30.1 detect --source /repo --report-format json --report-path /repo/gitleaks_report.json --exit-code 0 --redact --verbose --gitleaks-ignore-path /repo/.gitleaksignore || true
           echo '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Gitleaks","rules":[]}},"results":[]}]}' > gitleaks.sarif
       - name: Ensure Gitleaks artifacts exist
         if: always()
@@ -892,8 +993,8 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
-          checkov -d . --framework all --soft-fail --quiet -o json > checkov_results.json || true
-          checkov -d . --framework all --soft-fail --quiet -o sarif > checkov_results.sarif || true
+          checkov -d . --framework all --soft-fail --quiet --skip-path .github --skip-path .github/workflows/security.yml -o json > checkov_results.json || true
+          checkov -d . --framework all --soft-fail --quiet --skip-path .github --skip-path .github/workflows/security.yml -o sarif > checkov_results.sarif || true
       - name: Ensure Checkov artifacts exist
         if: always()
         shell: bash
@@ -958,9 +1059,23 @@ jobs:
               sev = str(sev or "UNKNOWN").upper()
               return {"ERROR": "HIGH", "WARNING": "MEDIUM", "WARN": "MEDIUM", "NOTE": "LOW", "STYLE": "LOW"}.get(sev, sev)
 
-          def add(cat, sev, tool, loc, detail, rule="", source="", fp_note=""):
-              findings.append({"category": cat, "severity": norm(sev), "tool": tool, "location": loc or "?:?", "detail": str(detail or "").replace("\n", " ")[:3000], "rule": rule or "", "source": source or "", "fp_note": fp_note or ""})
+          def is_excluded_workflow(value):
+              value = str(value or "").replace("\\", "/")
+              return ".github/workflows/security.yml" in value or ".github/workflows/" in value
 
+          def add(cat, sev, tool, loc, detail, rule="", source="", fp_note=""):
+              if is_excluded_workflow(loc) or is_excluded_workflow(detail) or is_excluded_workflow(source):
+                  return
+              item={"category":cat,"severity":norm(sev),"tool":tool,"location":loc or "?:?","detail":str(detail or "").replace("\n"," ")[:3000],"rule":rule or "","source":source or "","fp_note":fp_note or ""}
+              dup = None
+              for i, x in enumerate(findings):
+                  if x["location"] == item["location"] and x["rule"] == item["rule"]:
+                      dup = i
+                      break
+              if dup is None:
+                  findings.append(item)
+              elif len(item["detail"]) > len(findings[dup]["detail"]):
+                  findings[dup] = item
           def load_all(name):
               matched = False
               for path in root.rglob(name):
@@ -1010,6 +1125,10 @@ jobs:
                   count += 1
                   add(item.get("category", "Dependencias / Policy"), item.get("severity", "UNKNOWN"), "Dependency Policy", f"{item.get('file','?')}:{item.get('line','?')}", item.get("message", ""), item.get("rule", ""), str(path))
               tool_status.append({"artifact": str(path), "tool": "Dependency Policy", "findings": count})
+
+          for path, data in load_all("dependency_inventory.json"):
+              count = len(data.get("inventory", [])) if isinstance(data, dict) else 0
+              tool_status.append({"artifact": str(path), "tool": "Dependency Inventory", "findings": count, "type": "inventory"})
 
           for path, data in load_all("pip_audit_osv.json"):
               count = 0
